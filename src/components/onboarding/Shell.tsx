@@ -1,6 +1,7 @@
 "use client";
 
 import { ReactNode } from "react";
+import { Logo } from "@/components/Logo";
 
 type Props = {
   step: number;
@@ -42,6 +43,7 @@ export function Shell({
         <span className="text-xs font-semibold text-slate-500 tabular-nums">
           {step}/{total}
         </span>
+        <Logo className="h-5 w-auto text-slate-900 shrink-0" />
       </header>
 
       <div className="flex-1 flex flex-col items-center justify-center px-4 sm:px-8 py-6">

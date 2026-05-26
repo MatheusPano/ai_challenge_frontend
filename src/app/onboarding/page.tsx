@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Shell, PrimaryButton, OptionCard } from "@/components/onboarding/Shell";
 import { Icon } from "@/components/onboarding/Icon";
@@ -34,6 +34,7 @@ type Action =
   | { type: "toggle_category"; id: number }
   | { type: "answer_vark"; questionId: string; key: VarkKey }
   | { type: "set_current_question"; q: Question }
+  | { type: "clear_current_question" }
   | { type: "answer"; response: QuizResponse };
 
 const initial: OnboardingState = {
@@ -70,6 +71,8 @@ function reducer(s: OnboardingState, a: Action): OnboardingState {
     }
     case "set_current_question":
       return { ...s, quiz: { ...s.quiz, current: a.q } };
+    case "clear_current_question":
+      return { ...s, quiz: { ...s.quiz, current: undefined } };
     case "answer": {
       const responses = [...s.quiz.responses, a.response];
       const theta = updateTheta(s.quiz.theta, a.response);
@@ -250,14 +253,19 @@ function StepVark({
     const first = VARK_QUESTIONS.findIndex((q) => !state.vark[q.id]);
     return first === -1 ? VARK_QUESTIONS.length - 1 : first;
   });
-  const q = VARK_QUESTIONS[idx];
+  const safeIdx = Math.min(idx, VARK_QUESTIONS.length - 1);
+  const q = VARK_QUESTIONS[safeIdx];
   const selected = state.vark[q.id];
-  const isLast = idx === VARK_QUESTIONS.length - 1;
+  const isLast = safeIdx === VARK_QUESTIONS.length - 1;
 
   function choose(key: VarkKey) {
     dispatch({ type: "answer_vark", questionId: q.id, key });
     if (!isLast) {
-      setTimeout(() => setIdx((i) => i + 1), 180);
+      setTimeout(
+        () =>
+          setIdx((i) => Math.min(i + 1, VARK_QUESTIONS.length - 1)),
+        180,
+      );
     }
   }
 
@@ -306,6 +314,44 @@ function StepVark({
 
 /* ---------------- Step 4: CAT Quiz ---------------- */
 
+type Difficulty = "easy" | "medium" | "hard";
+
+async function fetchQuestion(args: {
+  goals: string[];
+  categoryIds: number[];
+  difficulty: Difficulty;
+  askedTopics: string[];
+  signal?: AbortSignal;
+  maxAttempts?: number;
+}): Promise<Question> {
+  const maxAttempts = args.maxAttempts ?? 3;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const r = await fetch("/api/quiz/next", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: args.signal,
+        body: JSON.stringify({
+          goals: args.goals,
+          categoryIds: args.categoryIds,
+          difficulty: args.difficulty,
+          askedTopics: args.askedTopics,
+        }),
+      });
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      return (await r.json()) as Question;
+    } catch (e) {
+      lastErr = e;
+      if (args.signal?.aborted) throw e;
+      if (attempt < maxAttempts) {
+        await new Promise((res) => setTimeout(res, 400 * attempt));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("fetch failed");
+}
+
 function StepQuiz({
   state,
   dispatch,
@@ -319,6 +365,13 @@ function StepQuiz({
   const [picked, setPicked] = useState<number | null>(null);
   const [startedAt, setStartedAt] = useState<number>(Date.now());
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // prefetched holds the question for the predicted-next difficulty.
+  const prefetchRef = useRef<{
+    difficulty: Difficulty;
+    promise: Promise<Question>;
+  } | null>(null);
 
   // Auto-advance when quiz is done
   useEffect(() => {
@@ -327,34 +380,86 @@ function StepQuiz({
     }
   }, [responses, dispatch]);
 
-  // Fetch next question
+  // Load current question — uses prefetched if difficulty matches.
   useEffect(() => {
     if (current) return;
     if (isFinished(responses)) return;
     let cancel = false;
-    setLoading(true);
-    setPicked(null);
-    fetch("/api/quiz/next", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        goals: state.goals,
-        categoryIds: state.categoryIds,
-        difficulty: nextDifficulty(theta),
-        askedTopics: responses.map((r) => r.question.topico),
-      }),
-    })
-      .then((r) => r.json())
-      .then((q: Question) => {
+    const controller = new AbortController();
+    const desired = nextDifficulty(theta);
+    const askedTopics = responses.map((r) => r.question.topico);
+
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      setPicked(null);
+      try {
+        let q: Question;
+        const cached = prefetchRef.current;
+        if (cached && cached.difficulty === desired) {
+          prefetchRef.current = null;
+          q = await cached.promise;
+        } else {
+          prefetchRef.current = null;
+          q = await fetchQuestion({
+            goals: state.goals,
+            categoryIds: state.categoryIds,
+            difficulty: desired,
+            askedTopics,
+            signal: controller.signal,
+          });
+        }
         if (cancel) return;
         dispatch({ type: "set_current_question", q });
         setStartedAt(Date.now());
-      })
-      .finally(() => !cancel && setLoading(false));
+      } catch (e) {
+        if (cancel) return;
+        setError((e as Error).message ?? "Falha ao carregar questão");
+      } finally {
+        if (!cancel) setLoading(false);
+      }
+    };
+
+    void load();
     return () => {
       cancel = true;
+      controller.abort();
     };
   }, [current, responses, theta, state.goals, state.categoryIds, dispatch]);
+
+  // Background prefetch: while the user reads/answers the current question,
+  // fetch the most likely next one. Picks the difficulty that would result
+  // from a correct answer (slightly biased optimistic — corrects fast at edges).
+  useEffect(() => {
+    if (!current || picked !== null) return; // don't prefetch after they pick (we'll know real next)
+    if (responses.length + 1 >= MAX_QUESTIONS) return;
+
+    const optimisticTheta = updateTheta(theta, {
+      question: current,
+      picked: current.correta,
+      correct: true,
+      latencyMs: 0,
+    });
+    const predictedDifficulty = nextDifficulty(optimisticTheta);
+
+    if (prefetchRef.current?.difficulty === predictedDifficulty) return;
+
+    const askedTopics = [
+      ...responses.map((r) => r.question.topico),
+      current.topico,
+    ];
+    const promise = fetchQuestion({
+      goals: state.goals,
+      categoryIds: state.categoryIds,
+      difficulty: predictedDifficulty,
+      askedTopics,
+    }).catch(() => {
+      // swallow — main loader will retry if needed
+      prefetchRef.current = null;
+      throw new Error("prefetch failed");
+    });
+    prefetchRef.current = { difficulty: predictedDifficulty, promise };
+  }, [current, picked, theta, responses, state.goals, state.categoryIds]);
 
   function submit() {
     if (picked === null || !current) return;
@@ -387,7 +492,20 @@ function StepQuiz({
         </PrimaryButton>
       }
     >
-      {loading || !current ? (
+      {error && !current ? (
+        <div className="text-center py-12">
+          <p className="text-rose-600 font-semibold">{error}</p>
+          <button
+            onClick={() => {
+              setError(null);
+              dispatch({ type: "clear_current_question" });
+            }}
+            className="mt-4 text-sm font-bold text-indigo-600 hover:underline"
+          >
+            Tentar novamente
+          </button>
+        </div>
+      ) : loading || !current ? (
         <div className="text-center py-12 text-slate-500">
           <div className="inline-block w-8 h-8 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
           <p className="mt-4">Preparando sua próxima questão...</p>
@@ -447,43 +565,66 @@ function StepFinalize({
   state: OnboardingState;
   router: ReturnType<typeof useRouter>;
 }) {
-  const [stage, setStage] = useState<"loading" | "done">("loading");
+  const [stage, setStage] = useState<"saving" | "planning" | "done">("saving");
   const level = thetaToLevel(state.quiz.theta);
   const correctCount = state.quiz.responses.filter((r) => r.correct).length;
 
   useEffect(() => {
-    const profile = {
-      goals: state.goals,
-      categoryIds: state.categoryIds,
-      level,
-      theta: state.quiz.theta,
-      topicSignals: state.quiz.responses.map((r) => ({
-        topico: r.question.topico,
-        correct: r.correct,
-        difficulty: r.question.dificuldade,
-      })),
-      styleWeights: scoreVark(Object.values(state.vark)),
-      scheduleStats: null,
+    let cancel = false;
+    (async () => {
+      const profile = {
+        goals: state.goals,
+        categoryIds: state.categoryIds,
+        level,
+        theta: state.quiz.theta,
+        topicSignals: state.quiz.responses.map((r) => ({
+          topico: r.question.topico,
+          correct: r.correct,
+          difficulty: r.question.dificuldade,
+        })),
+        styleWeights: scoreVark(Object.values(state.vark)),
+        scheduleStats: null,
+      };
+      try {
+        await fetch("/api/onboarding/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profile),
+        });
+        if (cancel) return;
+        setStage("planning");
+        // Pre-generate the plan now so /plan loads instantly from the DB later.
+        await fetch("/api/plan/generate", { method: "POST" });
+      } catch {
+        // ignore — plan can still be generated on first /plan visit
+      } finally {
+        if (!cancel) setStage("done");
+      }
+    })();
+    return () => {
+      cancel = true;
     };
-    fetch("/api/onboarding/complete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(profile),
-    })
-      .then(() => setStage("done"))
-      .catch(() => setStage("done"));
   }, []); // eslint-disable-line
+
+  const title =
+    stage === "saving"
+      ? "Salvando seu perfil..."
+      : stage === "planning"
+        ? "Montando sua trilha..."
+        : "Tudo pronto!";
+  const subtitle =
+    stage === "saving"
+      ? "Guardando suas respostas no nosso banco."
+      : stage === "planning"
+        ? "A IA está organizando seus tópicos e revisões."
+        : `Identificamos seu nível como ${level} (${correctCount}/${state.quiz.responses.length} acertos).`;
 
   return (
     <Shell
       step={5}
       total={TOTAL_STEPS}
-      title={stage === "loading" ? "Montando seu plano..." : "Tudo pronto!"}
-      subtitle={
-        stage === "loading"
-          ? "Analisando suas respostas e gerando recomendações."
-          : `Identificamos seu nível como ${level} (${correctCount}/${state.quiz.responses.length} acertos).`
-      }
+      title={title}
+      subtitle={subtitle}
       footer={
         stage === "done" ? (
           <PrimaryButton onClick={() => router.push("/plan")}>
@@ -493,7 +634,7 @@ function StepFinalize({
       }
     >
       <div className="flex justify-center py-8">
-        {stage === "loading" ? (
+        {stage !== "done" ? (
           <div className="w-16 h-16 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
         ) : (
           <div className="text-6xl">🎉</div>

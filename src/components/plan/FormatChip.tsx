@@ -24,16 +24,6 @@ const META: Record<
       </svg>
     ),
   },
-  podcast: {
-    color: "bg-rose-500/90 hover:bg-rose-400 text-white border-rose-400",
-    name: "Podcast",
-    icon: (
-      <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4">
-        <rect x="9" y="3" width="6" height="12" rx="3" />
-        <path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" fill="none" />
-      </svg>
-    ),
-  },
   quiz: {
     color: "bg-amber-500/90 hover:bg-amber-400 text-white border-amber-400",
     name: "Quiz",

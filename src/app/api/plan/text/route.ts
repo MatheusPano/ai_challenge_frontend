@@ -6,18 +6,15 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    // Body vazio/truncado (ex: cliente abortou a request com AbortController
-    // durante StrictMode double-effect). Responde 400 sem propagar pro backend.
     return NextResponse.json(
       { message: "invalid or empty JSON body" },
       { status: 400 },
     );
   }
   try {
-    const data = await backend<unknown>("/api/quiz/next", {
+    const data = await backend<unknown>("/api/plan/text", {
       method: "POST",
       body: JSON.stringify(body),
-      authRequired: false,
     });
     return NextResponse.json(data);
   } catch (e) {

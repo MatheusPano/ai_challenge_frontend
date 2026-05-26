@@ -1,4 +1,4 @@
-export type FormatKind = "video" | "text" | "podcast" | "quiz";
+export type FormatKind = "video" | "text" | "quiz";
 
 export type FormatOption = {
   kind: FormatKind;
@@ -8,16 +8,22 @@ export type FormatOption = {
   courseId?: number;
   courseBanner?: string;
   courseTitle?: string;
+  crcActive?: boolean;
+  crcCreditHours?: number | null;
   /** quiz */
   quizScope?: "review" | "topic";
   /** texto/podcast: hint pro gerador lazy */
   prompt?: string;
 };
 
+export type StopKind = "topic" | "review";
+
 export type Stop = {
   id: string;
+  kind: StopKind;
   topic: string;
   summary: string;
+  reviewsStopIds?: string[];
   formats: FormatOption[];
 };
 
@@ -38,7 +44,7 @@ export const VARK_TO_KIND: Record<
   FormatKind
 > = {
   visual: "video",
-  aural: "podcast",
+  aural: "video",
   reading: "text",
   kinesthetic: "quiz",
 };
